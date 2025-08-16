@@ -1,3 +1,6 @@
+
+---Tweaks made to original from https://github.com/tkuppens/kindercare
+
 kindercare_sync
 ===============
 
