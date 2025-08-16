@@ -1,122 +1,185 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# child id see Manage Children page: https://classroom.kindercare.com/accounts
-# ID is in the url : https://classroom.kindercare.com/accounts/xxxxxx 
+# KinderCare Classroom sync script (macOS & Linux compatible)
+# Requires: curl, jq, exiftool, ffmpeg, ImageMagick (optional for captioning)
+# Auth: export your logged-in cookies for classroom.kindercare.com to a file named `cookies.txt`
+# Place `cookies.txt` next to this script.
 
-child_id="xxxxxx"
+set -euo pipefail
+IFS=$'\n\t'
+
+child_id="xxxxx"
 no_insert_db=0
 caption=0
 
-
 usage() {
-        echo "Usage: $0 [ -cik xxxxxx ] " 1>&2
+  echo "Usage: $0 [-c] [-i] [-k xxxxxx]" 1>&2
 }
 
 exit_abnormal() {
-        usage
-        exit 1
+  usage
+  exit 1
 }
 
-while getopts "cik:" o; do
-	case "${o}" in
-		c)
-			caption=1
-			;;
-		i)
-			no_insert_db=1
-			;;
-		k)
-			child_id=${OPTARG}
-			;;
-		:)
-			echo "Error: -${OPTARG} requires an argument."
-			exit_abnormal
-			;;
-		*)
-			exit_abnormal
-			;;
-	esac
+while getopts ":cik:" o; do
+  case "${o}" in
+    c)
+      caption=1
+      ;;
+    i)
+      no_insert_db=1
+      ;;
+    k)
+      child_id=${OPTARG}
+      ;;
+    :)
+      echo "Error: -${OPTARG} requires an argument." 1>&2
+      exit_abnormal
+      ;;
+    *)
+      exit_abnormal
+      ;;
+  esac
 done
 
-if [ ! -s $(dirname ${0})/${child_id}/id.db ]; then
-  mkdir $(dirname ${0})/${child_id}
-  mkdir /tmp/_${child_id}
-  touch $(dirname ${0})/${child_id}/id.db
+# Paths
+script_dir=$(cd "$(dirname "$0")" && pwd)
+work_dir="/tmp/_${child_id}"
+out_dir="${script_dir}/${child_id}"
+cookies_file="${script_dir}/cookies.txt"
+id_db="${out_dir}/id.db"
+
+# Dependency & auth checks
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" 1>&2; exit 2; }; }
+for cmd in curl jq exiftool ffmpeg; do need_cmd "$cmd"; done
+
+# Image captioning (optional)
+convert_bin=""
+if [[ "$caption" == "1" ]]; then
+  if command -v convert >/dev/null 2>&1; then
+    convert_bin="convert"
+  elif command -v magick >/dev/null 2>&1; then
+    convert_bin="magick convert"
+  else
+    echo "Captioning requested (-c) but ImageMagick is not installed. Install it or run without -c." 1>&2
+    exit 2
+  fi
 fi
 
+if [[ ! -f "$cookies_file" ]]; then
+  echo "cookies.txt not found at $cookies_file. Export your browser cookies for classroom.kindercare.com and save them there." 1>&2
+  exit 2
+fi
 
-done=0
-k=1
+mkdir -p "$out_dir" "$work_dir"
+: > "$id_db" # ensure file exists
 
-until [ $done == "1" ]; do
-	wget -q --load-cookies $(dirname ${0})/cookies.txt "https://classroom.kindercare.com/accounts/${child_id}/journal_api?page=${k}" -O /tmp/_${child_id}/_act
+# Helper: make a safe filename timestamp from ISO-ish input
+iso_to_stamp() {
+  # Input may look like: 2024-06-04T19:33:27.000-04:00
+  local raw="$1"
+  local digits
+  digits=$(printf '%s' "$raw" | tr -cd '0-9')
+  # Expect at least YYYYMMDDHHMMSS
+  local y=${digits:0:4}
+  local m=${digits:4:2}
+  local d=${digits:6:2}
+  local H=${digits:8:2}
+  local M=${digits:10:2}
+  local S=${digits:12:2}
+  printf '%s%s%s_%s%s%s' "$y" "$m" "$d" "$H" "$M" "$S"
+}
 
-	jq '.intervals[] | .[].activity' /tmp/_${child_id}/_act > /tmp/_${child_id}/_jsontemp 
+page=1
+while :; do
+  curl -sS -b "$cookies_file" "https://classroom.kindercare.com/accounts/${child_id}/journal_api?page=${page}" \
+    -o "${work_dir}/_act"
 
-	if [ -s /tmp/_${child_id}/_jsontemp ]; then
-		jq '.activity_file_id' /tmp/_${child_id}/_jsontemp  > /tmp/_${child_id}/_id 
-		jq '.title' /tmp/_${child_id}/_jsontemp > /tmp/_${child_id}/_title 
-		jq '.description' /tmp/_${child_id}/_jsontemp > /tmp/_${child_id}/_desc
-		jq '.created_at' /tmp/_${child_id}/_jsontemp > /tmp/_${child_id}/_date
-		jq '.image.big.url,.video.url' /tmp/_${child_id}/_jsontemp | grep -v null  > /tmp/_${child_id}/_img
+  # Any intervals on this page?
+  if ! jq -e '.intervals | length > 0' "${work_dir}/_act" >/dev/null 2>&1; then
+    break
+  fi
 
-		sort /tmp/_${child_id}/_id > /tmp/_${child_id}/_id_new
-		
-		comm -3 --output-delimiter=+ $(dirname ${0})/${child_id}/id.db /tmp/_${child_id}/_id_new | grep + | cut -d"+" -f2 > /tmp/_${child_id}/_delta
-		
-		n=`cat /tmp/_${child_id}/_id | wc -l`
+  # Flatten activities into one-per-line JSON
+  jq -c '.intervals[][] | .activity' "${work_dir}/_act" > "${work_dir}/_jsontemp" || true
+  if [[ ! -s "${work_dir}/_jsontemp" ]]; then
+    break
+  fi
 
-		new=`cat /tmp/_${child_id}/_delta | wc -l`
+  # Extract fields
+  jq -r '.activity_file_id' "${work_dir}/_jsontemp"  > "${work_dir}/_id"
+  jq -r '.title // ""'          "${work_dir}/_jsontemp" > "${work_dir}/_title"
+  jq -r '.description // ""'    "${work_dir}/_jsontemp" > "${work_dir}/_desc"
+  jq -r '.created_at // ""'     "${work_dir}/_jsontemp" > "${work_dir}/_date"
+  jq -r '.image.big.url, .video.url | select(. != null)' "${work_dir}/_jsontemp" > "${work_dir}/_img"
 
-		if [ $new -gt 0 ]; then
-			i=1
-			until [ $i -gt $n ]; do
-				id=`head -$i /tmp/_${child_id}/_id | tail -1`  
-			 	test=`grep $id /tmp/_${child_id}/_delta`
-				
-				if [ ! -z "$test" ]; then
-					date=`head -$i /tmp/_${child_id}/_date | tail -1 | tr -d '\"'` 
-					date=`date -d$date +%Y%m%d_%H%M%S`
-					desc=`head -$i /tmp/_${child_id}/_desc | tail -1 | tr -d '\"' | tr -dc '[:alnum:][ ][.!?]\n\r'`  
-					desc=${desc/"Look what I'm doing today!"/}
-					title=`head -$i /tmp/_${child_id}/_title | tail -1 | tr -d '\"' | tr -dc "[:alnum:][ ][.!?']\n\r"`  
-					title=${title/"Look what I'm doing today!"/}
-					img=`head -$i /tmp/_${child_id}/_img | tail -1 | tr -d '\"'`  
-					
-					vidtest=`echo $img | grep "activity_file/video"`
-					if [ -z "$vidtest" ]; then
-						wget -q $img -O ${child_id}/${date}.jpg
-						exiftool -XPcomment="$desc" -title="$title $desc" ${child_id}/${date}.jpg
-						if [ "$caption" == "1" ]; then
-							size=`exiftool -ImageSize ${child_id}/${date}.jpg | cut -d: -f2 | cut -dx -f1 | cut -d\  -f2`
-							convert ${child_id}/${date}.jpg -background lightgray -size ${size}x -pointsize 20 caption:"$title $desc" -gravity center -append result.jpg
-							mv -f result.jpg ${child_id}/${date}.jpg
-						fi
-					else
-						wget -q $img -O ${child_id}/${date}.mov
-						echo "converting video"
-						ffmpeg -loglevel panic -i ${child_id}/${date}.mov -metadata title="$title $desc" ${child_id}/${date}.mp4
-						rm ${child_id}/${date}.mov
-					fi
-				else
-					done=1
-				fi
-				((i++))
-			done
-		else
-			done=1
-		fi
-		
-		((k++))
+  # Portable diff: new IDs not in db (BSD/GNU compatible)
+  sort -u "${work_dir}/_id" > "${work_dir}/_id_new"
+  sort -u "$id_db" > "${work_dir}/id.db_sorted"
+  grep -F -x -v -f "${work_dir}/id.db_sorted" "${work_dir}/_id_new" > "${work_dir}/_delta" || true
 
-		if [ "$no_insert_db" == "0" ]; then
-			cat /tmp/_${child_id}/_delta >> $(dirname ${0})/${child_id}/id.db
-			sort -u $(dirname ${0})/${child_id}/id.db > /tmp/_${child_id}/id.db_sorted
-			mv /tmp/_${child_id}/id.db_sorted $(dirname ${0})/${child_id}/id.db
-		fi
-		rm -rf /tmp/_${child_id}/_act /tmp/_${child_id}/_id /tmp/_${child_id}/_title /tmp/_${child_id}/_desc /tmp/_${child_id}/_date /tmp/_${child_id}/_img /tmp/_${child_id}/_delta /tmp/_${child_id}/_jsontemp $(dirname ${0})/${child_id}/*.jpg_original
-	else
-		done=1
-	fi
+  total=$(wc -l < "${work_dir}/_id")
+  new=$(wc -l < "${work_dir}/_delta")
+
+  if [[ "$new" -gt 0 ]]; then
+    i=1
+    while [[ "$i" -le "$total" ]]; do
+      id=$(sed -n "${i}p" "${work_dir}/_id")
+      if grep -F -x -q "$id" "${work_dir}/_delta"; then
+        raw_date=$(sed -n "${i}p" "${work_dir}/_date")
+        stamp=$(iso_to_stamp "$raw_date")
+        raw_desc=$(sed -n "${i}p" "${work_dir}/_desc")
+        raw_title=$(sed -n "${i}p" "${work_dir}/_title")
+        # Clean text for metadata/caption (allow letters, numbers, space, basic punct.)
+        desc=$(printf '%s' "$raw_desc" | tr -dc '[:alnum:][:space:][.!?]\n\r' || true)
+        title=$(printf '%s' "$raw_title" | tr -dc "[:alnum:][:space:][.!?']\n\r" || true)
+        img=$(sed -n "${i}p" "${work_dir}/_img")
+
+        # Remove boilerplate if present
+        title=${title/Look what I\'m doing today!/}
+        desc=${desc/Look what I\'m doing today!/}
+
+        if printf '%s' "$img" | grep -q "activity_file/video"; then
+          # Video
+          curl -sSL "$img" -o "${out_dir}/${stamp}.mov"
+          echo "converting video: ${stamp}.mov -> ${stamp}.mp4"
+          ffmpeg -loglevel error -y -i "${out_dir}/${stamp}.mov" -metadata title="$title $desc" "${out_dir}/${stamp}.mp4"
+          rm -f "${out_dir}/${stamp}.mov"
+        else
+          # Photo
+          curl -sSL "$img" -o "${out_dir}/${stamp}.jpg"
+          exiftool -overwrite_original -XPcomment="$desc" -title="$title $desc" "${out_dir}/${stamp}.jpg" >/dev/null 2>&1 || true
+          if [[ "$caption" == "1" ]] && [[ -n "$convert_bin" ]] && { [[ -n "$title" ]] || [[ -n "$desc" ]]; }; then
+            width=$(exiftool -s -s -s -ImageWidth "${out_dir}/${stamp}.jpg" 2>/dev/null || echo 0)
+            [[ "$width" =~ ^[0-9]+$ ]] || width=0
+            if [[ "$width" -gt 0 ]]; then
+              # Append a caption panel of same width; ImageMagick v6/v7 supported
+              eval "$convert_bin \"${out_dir}/${stamp}.jpg\" -background lightgray -size ${width}x -pointsize 20 caption:\"$title $desc\" -gravity center -append \"${out_dir}/__tmp_${stamp}.jpg\"" >/dev/null 2>&1 || true
+              if [[ -f "${out_dir}/__tmp_${stamp}.jpg" ]]; then
+                mv -f "${out_dir}/__tmp_${stamp}.jpg" "${out_dir}/${stamp}.jpg"
+              fi
+            fi
+          fi
+        fi
+      fi
+      i=$(( i + 1 ))
+    done
+  else
+    # No new IDs on this page; stop
+    break
+  fi
+
+  # Next page
+  page=$(( page + 1 ))
+
+  # Update DB and tidy
+  if [[ "$no_insert_db" == "0" ]]; then
+    cat "${work_dir}/_delta" >> "$id_db"
+    sort -u "$id_db" > "${work_dir}/id.db_sorted"
+    mv "${work_dir}/id.db_sorted" "$id_db"
+  fi
+  rm -f "${work_dir}/_act" "${work_dir}/_id" "${work_dir}/_title" "${work_dir}/_desc" "${work_dir}/_date" "${work_dir}/_img" "${work_dir}/_delta" "${work_dir}/_jsontemp"
 done
 
+# Final DB dedupe (safety)
+sort -u "$id_db" -o "$id_db"
